@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from ultralytics import YOLO
+import time
 
 ###############################################
 # 1. DEFINE CAMERA PARAMETERS
@@ -49,9 +50,10 @@ T = T_03 - R @ T_02
 baseline = abs(T[0,0])
 
 ###############################################
-# 3. RECTIFICATION
+# 3. RECTIFICATION SETUP (RUNS ONCE)
 ###############################################
-image_size = (1392, 512)   # KITTI camera2/3 original resolution
+# NOTE: Your input video MUST match this resolution (1392x512)
+image_size = (1392, 512)   
 
 # Stereo rectification
 R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
@@ -71,7 +73,6 @@ right_map_x, right_map_y = cv2.initUndistortRectifyMap(
 ###############################################
 # 4. SGBM MATCHING (UPDATED)
 ###############################################
-# Added speckle filtering and mode 3WAY for better accuracy/robustness
 
 stereo = cv2.StereoSGBM_create(
     minDisparity=0,
@@ -79,37 +80,35 @@ stereo = cv2.StereoSGBM_create(
     blockSize=5,
     P1=8 * 3 * 5 * 5,
     P2=32 * 3 * 5 * 5,
-    disp12MaxDiff=1,         # Consistency check
-    uniquenessRatio=10,      # Filter out pixels if best match isn't significantly better than 2nd best
-    speckleWindowSize=100,   # Remove small "islands" of noise (white dots)
-    speckleRange=32,         # Threshold for speckle detection
-    mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY # Better accuracy
+    disp12MaxDiff=1,         
+    uniquenessRatio=10,      
+    speckleWindowSize=100,   
+    speckleRange=32,         
+    mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
 )
 
 ###############################################
-# 5. COMPUTE DISPARITY MAP AND DO 3D REPROJECTION
+# 5. INITIALIZE MODEL (RUNS ONCE)
+###############################################
+# Load model outside the loop to ensure high FPS
+# Replace with your custom trained model path if needed (e.g., "runs/detect/exp1/weights/best.pt")
+yolo_model = YOLO("yolov8n.pt") 
+
+###############################################
+# 6. HELPER FUNCTIONS
 ###############################################
 
 def compute_disparity(left_img, right_img):
+    # Remap images using the pre-calculated maps
     left_rect = cv2.remap(left_img, left_map_x, left_map_y, cv2.INTER_LINEAR)
     right_rect = cv2.remap(right_img, right_map_x, right_map_y, cv2.INTER_LINEAR)
 
     grayL = cv2.cvtColor(left_rect, cv2.COLOR_BGR2GRAY)
     grayR = cv2.cvtColor(right_rect, cv2.COLOR_BGR2GRAY)
 
-    # Note: result is 16-bit signed, we divide by 16.0 to get real disparity
+    # Compute disparity
     disparity = stereo.compute(grayL, grayR).astype(np.float32) / 16.0
     return disparity, Q, left_rect
-
-# Convert disparity -> 3D coordinates
-def disparity_to_points_3d(disparity, Q):
-    return cv2.reprojectImageTo3D(disparity, Q)
-
-
-###############################################
-# 6. OBTAIN DEPTH INFORMATION FROM YOLO BBOX (UPDATED)
-###############################################
-# Now uses Median depth of the ROI, rather than a single center pixel
 
 def get_depth_from_yolo_box(box, points_3d, disparity_map):
     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
@@ -119,7 +118,7 @@ def get_depth_from_yolo_box(box, points_3d, disparity_map):
     x1, x2 = max(0, x1), min(w, x2)
     y1, y2 = max(0, y1), min(h, y2)
 
-    # Safety check: if box is invalid or 0 size
+    # Safety check
     if x1 >= x2 or y1 >= y2:
         return None
 
@@ -128,20 +127,18 @@ def get_depth_from_yolo_box(box, points_3d, disparity_map):
     roi_disp = disparity_map[y1:y2, x1:x2]
 
     # Filter: valid disparity points (disparity > 0)
-    # SGBM usually returns 0 or -1 for invalid matches
     mask = roi_disp > 0  
     
-    # Extract Z values where disparity was valid
+    # Extract Z values
     valid_depths = roi_3d[mask, 2] 
 
-    # Further filter: remove Crazy outliers (e.g. negative Z or Z > 150m)
-    # This helps when reprojectImageTo3D creates massive numbers for disp~0
+    # Filter outliers
     valid_depths = valid_depths[(valid_depths > 0.5) & (valid_depths < 150.0)]
 
     if len(valid_depths) == 0:
-        return None # No valid depth info found in this box
+        return None
 
-    # Use Median to ignore outliers/reflections
+    # Use Median
     Z = np.median(valid_depths)
     
     cx = int((x1 + x2) / 2)
@@ -154,45 +151,28 @@ def get_depth_from_yolo_box(box, points_3d, disparity_map):
         "confidence": float(box.conf[0])
     }
 
-###############################################
-# 7. FULL PIPELINE (UPDATED)
-###############################################
-
-def process_stereo_images(left_img_path, right_img_path, yolo_model_path="yolo.pt"):
-    # Load images
-    left_img = cv2.imread(left_img_path)
-    right_img = cv2.imread(right_img_path)
-
+def process_frame(frameL, frameR):
     # Compute disparity + rectified left
-    disparity, Q, left_rect = compute_disparity(left_img, right_img)
+    disparity, Q, left_rect = compute_disparity(frameL, frameR)
 
     # Convert disparity -> 3D map
-    points_3d = disparity_to_points_3d(disparity, Q)
+    points_3d = cv2.reprojectImageTo3D(disparity, Q)
 
     # Run YOLO on the (rectified) left image
-    model = YOLO(yolo_model_path)
-    
-    # Optional: Increase inference size for small objects (KITTI is wide)
-    # results = model(left_rect, imgsz=1280)[0] 
-    results = model(left_rect)[0]
-
-    depth_results = []
+    # verbose=False prevents the terminal from flooding with detection logs
+    results = yolo_model(left_rect, verbose=False)[0]
 
     for box in results.boxes:
-        # Pass disparity map to helper now
         depth_info = get_depth_from_yolo_box(box, points_3d, disparity)
         
         if depth_info is not None:
-            depth_results.append(depth_info)
-
-            # Draw the bounding box and depth on image
             cx, cy = depth_info["pixel_center"]
             Z = depth_info["Z"]
             cls_id = depth_info["class"]
 
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
             
-            # Color code: Green usually, but Red if very close (< 10m)
+            # Color code: Red if close (< 10m), Green otherwise
             color = (0, 0, 255) if Z < 10.0 else (0, 255, 0)
             
             cv2.rectangle(left_rect, (x1,y1), (x2,y2), color, 2)
@@ -200,36 +180,68 @@ def process_stereo_images(left_img_path, right_img_path, yolo_model_path="yolo.p
             label_text = f"C:{cls_id} Z={Z:.2f}m"
             cv2.putText(left_rect,
                         label_text,
-                        (x1, y1 - 10), # Put text above box
+                        (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, color, 2)
         else:
-            # Draw box but indicate unknown depth
+            # Draw box with unknown depth
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
             cv2.rectangle(left_rect, (x1,y1), (x2,y2), (128,128,128), 2)
             cv2.putText(left_rect, "Z=?", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128,128,128), 2)
 
-    return left_rect, disparity, depth_results
+    return left_rect, disparity
 
-# Example usage
+###############################################
+# 7. MAIN VIDEO LOOP
+###############################################
 
 if __name__ == "__main__":
-    left_image = "left.png" 
-    right_image = "right.png"
-    yolo_weights = "yolov8n.pt" # Or your trained "runs/.../weights/best.pt"
+    # --- UPDATE THESE PATHS TO YOUR VIDEO FILES ---
+    video_left_path = "video_left.avi"
+    video_right_path = "video_right.avi"
 
-    annotated_img, disparity_map, depths = process_stereo_images(
-        left_image, right_image, yolo_weights
-    )
+    cap_left = cv2.VideoCapture(video_left_path)
+    cap_right = cv2.VideoCapture(video_right_path)
 
-    # Print all detected object depths:
-    for d in depths:
-        print(f"Class {d['class']} | Depth: {d['Z']:.2f} m | Center: {d['pixel_center']}")
+    # Check if opened successfully
+    if not cap_left.isOpened() or not cap_right.isOpened():
+        print("Error: Could not open video streams.")
+        exit()
 
-    cv2.imshow("Detections with Depth", annotated_img)
-    
-    # Normalize disparity for visualization
-    disp_vis = cv2.normalize(disparity_map, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-    cv2.imshow("Disparity", disp_vis)
-    
-    cv2.waitKey(0)
+    print("Starting video inference... Press 'q' to stop.")
+
+    while True:
+        start_time = time.time()
+
+        # Read frames simultaneously
+        retL, frameL = cap_left.read()
+        retR, frameR = cap_right.read()
+
+        # Break if video ends
+        if not retL or not retR:
+            print("End of video stream.")
+            break
+
+        # --- PROCESS FRAME ---
+        annotated_img, disparity_map = process_frame(frameL, frameR)
+
+        # Calculate FPS
+        fps = 1.0 / (time.time() - start_time)
+        cv2.putText(annotated_img, f"FPS: {fps:.1f}", (20, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+
+        # Show Output
+        cv2.imshow("Stereo YOLO Depth", annotated_img)
+        
+        # Normalize disparity for visualization (optional)
+        disp_vis = cv2.normalize(disparity_map, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        cv2.imshow("Disparity", disp_vis)
+        
+        # Press 'q' to quit
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # Clean up
+    cap_left.release()
+    cap_right.release()
+    cv2.destroyAllWindows()
