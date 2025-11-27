@@ -2,11 +2,13 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import time
+import glob
+import os
 
 ###############################################
 # 1. DEFINE CAMERA PARAMETERS
 ###############################################
-# (Kept identical to your original provided code)
+# (Kept identical to previous versions)
 
 # Camera 2 intrinsics
 K_02 = np.array([
@@ -52,7 +54,7 @@ baseline = abs(T[0,0])
 ###############################################
 # 3. RECTIFICATION SETUP (RUNS ONCE)
 ###############################################
-# NOTE: Your input video MUST match this resolution (1392x512)
+# NOTE: Your input images MUST match this resolution (1392x512)
 image_size = (1392, 512)   
 
 # Stereo rectification
@@ -71,7 +73,7 @@ right_map_x, right_map_y = cv2.initUndistortRectifyMap(
 
 
 ###############################################
-# 4. SGBM MATCHING (UPDATED)
+# 4. SGBM MATCHING
 ###############################################
 
 stereo = cv2.StereoSGBM_create(
@@ -90,8 +92,6 @@ stereo = cv2.StereoSGBM_create(
 ###############################################
 # 5. INITIALIZE MODEL (RUNS ONCE)
 ###############################################
-# Load model outside the loop to ensure high FPS
-# Replace with your custom trained model path if needed (e.g., "runs/detect/exp1/weights/best.pt")
 yolo_model = YOLO("yolov8n.pt") 
 
 ###############################################
@@ -159,7 +159,6 @@ def process_frame(frameL, frameR):
     points_3d = cv2.reprojectImageTo3D(disparity, Q)
 
     # Run YOLO on the (rectified) left image
-    # verbose=False prevents the terminal from flooding with detection logs
     results = yolo_model(left_rect, verbose=False)[0]
 
     for box in results.boxes:
@@ -192,48 +191,59 @@ def process_frame(frameL, frameR):
     return left_rect, disparity
 
 ###############################################
-# 7. MAIN VIDEO LOOP
+# 7. MAIN FOLDER LOOP (MODIFIED)
 ###############################################
 
 if __name__ == "__main__":
-    # --- UPDATE THESE PATHS TO YOUR VIDEO FILES ---
-    video_left_path = "video_left.avi"
-    video_right_path = "video_right.avi"
+    # --- UPDATE THESE PATHS TO YOUR IMAGE FOLDERS ---
+    left_folder = "data/image_02/data/"   # Example KITTI path
+    right_folder = "data/image_03/data/"  # Example KITTI path
+    
+    # Get list of files and sort them to ensure synchronization
+    # Adjust extension (*.png or *.jpg) as needed
+    left_files = sorted(glob.glob(os.path.join(left_folder, "*.png")))
+    right_files = sorted(glob.glob(os.path.join(right_folder, "*.png")))
 
-    cap_left = cv2.VideoCapture(video_left_path)
-    cap_right = cv2.VideoCapture(video_right_path)
-
-    # Check if opened successfully
-    if not cap_left.isOpened() or not cap_right.isOpened():
-        print("Error: Could not open video streams.")
+    # Verify we have images
+    if not left_files or not right_files:
+        print("Error: No images found in one of the folders.")
+        print(f"Left count: {len(left_files)}, Right count: {len(right_files)}")
         exit()
 
-    print("Starting video inference... Press 'q' to stop.")
+    # Verify counts match (warn if not)
+    if len(left_files) != len(right_files):
+        print(f"Warning: Image counts do not match! L: {len(left_files)}, R: {len(right_files)}")
+        print("Processing only up to the minimum count.")
+    
+    num_frames = min(len(left_files), len(right_files))
+    
+    print(f"Starting processing for {num_frames} frames... Press 'q' to stop.")
 
-    while True:
+    for i in range(num_frames):
         start_time = time.time()
 
-        # Read frames simultaneously
-        retL, frameL = cap_left.read()
-        retR, frameR = cap_right.read()
+        # Load images
+        frameL = cv2.imread(left_files[i])
+        frameR = cv2.imread(right_files[i])
 
-        # Break if video ends
-        if not retL or not retR:
-            print("End of video stream.")
-            break
+        if frameL is None or frameR is None:
+            print(f"Error reading frame {i}. Skipping.")
+            continue
 
         # --- PROCESS FRAME ---
         annotated_img, disparity_map = process_frame(frameL, frameR)
 
         # Calculate FPS
-        fps = 1.0 / (time.time() - start_time)
+        elapsed = time.time() - start_time
+        fps = 1.0 / elapsed if elapsed > 0 else 0
+        
         cv2.putText(annotated_img, f"FPS: {fps:.1f}", (20, 50), 
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
         # Show Output
         cv2.imshow("Stereo YOLO Depth", annotated_img)
         
-        # Normalize disparity for visualization (optional)
+        # Normalize disparity for visualization
         disp_vis = cv2.normalize(disparity_map, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
         cv2.imshow("Disparity", disp_vis)
         
@@ -241,7 +251,4 @@ if __name__ == "__main__":
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # Clean up
-    cap_left.release()
-    cap_right.release()
     cv2.destroyAllWindows()
