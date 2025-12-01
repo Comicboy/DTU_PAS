@@ -54,7 +54,7 @@ baseline = abs(T[0,0])
 ###############################################
 # 3. RECTIFICATION SETUP (RUNS ONCE)
 ###############################################
-image_size = (1392, 512)   
+image_size = (1224, 370)   
 
 # Stereo rectification
 R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
@@ -217,11 +217,11 @@ def process_frame(frame_idx, frameL, frameR, detections):
 ###############################################
 
 if __name__ == "__main__":
-    left_folder = "data/image_02/data/"   
-    right_folder = "data/image_03/data/"  
+    left_folder = "Finale project/34759_final_project_rect/seq_01/image_02/data"   
+    right_folder = "Finale project/34759_final_project_rect/seq_01/image_03/data"  
     
     # CSV Paths
-    left_csv_path = "LeftResults.csv"
+    left_csv_path = "Finale project/LeftResult.csv"
     # Note: Usually we only need detections on the Left frame for stereo depth assignment.
     # If you have RightResults, we usually don't use them for depth unless doing advanced 3D IoU matching.
     # We will load LeftResults to draw on the Left Image.
