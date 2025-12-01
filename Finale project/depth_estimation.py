@@ -54,7 +54,6 @@ baseline = abs(T[0,0])
 ###############################################
 # 3. RECTIFICATION SETUP (RUNS ONCE)
 ###############################################
-# NOTE: Your input images MUST match this resolution (1392x512)
 image_size = (1392, 512)   
 
 # Stereo rectification
@@ -90,11 +89,6 @@ stereo = cv2.StereoSGBM_create(
 )
 
 ###############################################
-# 5. INITIALIZE MODEL (RUNS ONCE)
-###############################################
-yolo_model = YOLO("yolov8n.pt") 
-
-###############################################
 # 6. HELPER FUNCTIONS
 ###############################################
 
@@ -112,33 +106,21 @@ def compute_disparity(left_img, right_img):
 
 def get_depth_from_yolo_box(box, points_3d, disparity_map):
     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-
-    # Ensure coordinates are within image bounds
     h, w = points_3d.shape[:2]
     x1, x2 = max(0, x1), min(w, x2)
     y1, y2 = max(0, y1), min(h, y2)
 
-    # Safety check
-    if x1 >= x2 or y1 >= y2:
-        return None
+    if x1 >= x2 or y1 >= y2: return None
 
-    # Crop the 3D ROI and the Disparity ROI
     roi_3d = points_3d[y1:y2, x1:x2]
     roi_disp = disparity_map[y1:y2, x1:x2]
 
-    # Filter: valid disparity points (disparity > 0)
     mask = roi_disp > 0  
-    
-    # Extract Z values
     valid_depths = roi_3d[mask, 2] 
-
-    # Filter outliers
     valid_depths = valid_depths[(valid_depths > 0.5) & (valid_depths < 150.0)]
 
-    if len(valid_depths) == 0:
-        return None
+    if len(valid_depths) == 0: return None
 
-    # Use Median
     Z = np.median(valid_depths)
     
     cx = int((x1 + x2) / 2)
@@ -151,14 +133,10 @@ def get_depth_from_yolo_box(box, points_3d, disparity_map):
         "confidence": float(box.conf[0])
     }
 
-def process_frame(frameL, frameR):
-    # Compute disparity + rectified left
+def process_frame(frameL, frameR, yolo_model):
     disparity, Q, left_rect = compute_disparity(frameL, frameR)
-
-    # Convert disparity -> 3D map
     points_3d = cv2.reprojectImageTo3D(disparity, Q)
 
-    # Run YOLO on the (rectified) left image
     results = yolo_model(left_rect, verbose=False)[0]
 
     for box in results.boxes:
@@ -170,20 +148,12 @@ def process_frame(frameL, frameR):
             cls_id = depth_info["class"]
 
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-            
-            # Color code: Red if close (< 10m), Green otherwise
             color = (0, 0, 255) if Z < 10.0 else (0, 255, 0)
             
             cv2.rectangle(left_rect, (x1,y1), (x2,y2), color, 2)
-
             label_text = f"C:{cls_id} Z={Z:.2f}m"
-            cv2.putText(left_rect,
-                        label_text,
-                        (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, color, 2)
+            cv2.putText(left_rect, label_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         else:
-            # Draw box with unknown depth
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
             cv2.rectangle(left_rect, (x1,y1), (x2,y2), (128,128,128), 2)
             cv2.putText(left_rect, "Z=?", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128,128,128), 2)
@@ -195,60 +165,62 @@ def process_frame(frameL, frameR):
 ###############################################
 
 if __name__ == "__main__":
-    # --- UPDATE THESE PATHS TO YOUR IMAGE FOLDERS ---
-    left_folder = "data/image_02/data/"   # Example KITTI path
-    right_folder = "data/image_03/data/"  # Example KITTI path
+    left_folder = "data/image_02/data/"   
+    right_folder = "data/image_03/data/"  
+    yolo_path = "kitti_yolo_runs/exp1/weights/best.pt"
+
+    print("Loading YOLO model...")
+    yolo_model = YOLO(yolo_path)
     
-    # Get list of files and sort them to ensure synchronization
-    # Adjust extension (*.png or *.jpg) as needed
     left_files = sorted(glob.glob(os.path.join(left_folder, "*.png")))
     right_files = sorted(glob.glob(os.path.join(right_folder, "*.png")))
 
-    # Verify we have images
     if not left_files or not right_files:
-        print("Error: No images found in one of the folders.")
-        print(f"Left count: {len(left_files)}, Right count: {len(right_files)}")
+        print("Error: No images found.")
         exit()
 
-    # Verify counts match (warn if not)
-    if len(left_files) != len(right_files):
-        print(f"Warning: Image counts do not match! L: {len(left_files)}, R: {len(right_files)}")
-        print("Processing only up to the minimum count.")
-    
     num_frames = min(len(left_files), len(right_files))
-    
-    print(f"Starting processing for {num_frames} frames... Press 'q' to stop.")
+    print(f"Starting processing for {num_frames} frames...")
+
+    # Flag to ensure we only save once
+    has_saved_disparity = False
 
     for i in range(num_frames):
         start_time = time.time()
 
-        # Load images
         frameL = cv2.imread(left_files[i])
         frameR = cv2.imread(right_files[i])
 
-        if frameL is None or frameR is None:
-            print(f"Error reading frame {i}. Skipping.")
-            continue
+        if frameL is None or frameR is None: continue
 
         # --- PROCESS FRAME ---
-        annotated_img, disparity_map = process_frame(frameL, frameR)
+        annotated_img, disparity_map = process_frame(frameL, frameR, yolo_model)
 
-        # Calculate FPS
+        # --- SAVE DISPARITY MAP (ONCE) ---
+        if not has_saved_disparity:
+            print(f"Saving disparity map for Frame {i}...")
+            
+            # Normalize and Colorize
+            disp_vis = cv2.normalize(disparity_map, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+            disp_color = cv2.applyColorMap(disp_vis, cv2.COLORMAP_JET)
+            
+            cv2.imwrite("single_disparity_sample.png", disp_color)
+            has_saved_disparity = True
+            print("Saved 'single_disparity_sample.png' successfully.")
+
+        # --- VISUALIZATION ---
         elapsed = time.time() - start_time
         fps = 1.0 / elapsed if elapsed > 0 else 0
-        
-        cv2.putText(annotated_img, f"FPS: {fps:.1f}", (20, 50), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        cv2.putText(annotated_img, f"FPS: {fps:.1f}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
-        # Show Output
         cv2.imshow("Stereo YOLO Depth", annotated_img)
         
-        # Normalize disparity for visualization
-        disp_vis = cv2.normalize(disparity_map, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        cv2.imshow("Disparity", disp_vis)
+        # We still show the live disparity in the window, even if not saving
+        disp_live = cv2.normalize(disparity_map, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        cv2.imshow("Disparity Live", disp_live)
         
-        # Press 'q' to quit
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cv2.destroyAllWindows()
+    print("Processing complete.")
