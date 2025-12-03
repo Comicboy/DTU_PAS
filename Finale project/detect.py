@@ -21,12 +21,12 @@ def detect_objects(data):
     bbox: A list of detected bounding box objects in all the images
     '''
     bbox = []
-    model = YOLO("kitti_yolo_runs/exp1/weights/best.pt")
+    model = YOLO("kitti_yolo_runs/exp2/weights/best.pt")
 
-    tracker = "bytetrack.yaml"
+    tracker = "bytetrack_modified.yaml"
     for image_path in data:
         img = cv2.imread(image_path)
-        result = model.track(img, persist = True, tracker = tracker, iou = 0.3, conf = 0.5)
+        result = model.track(img, persist = True, tracker = tracker, iou = 0.7, conf = 0.5)
 
         try:
             bbox.append(result[0].boxes)
@@ -64,31 +64,6 @@ def frame_bb(img, boxes, cls, track, trackChecker = None):
     
     return imgFrame
 
-def IoU(boxRef, boxes):
-    '''
-    Calculates the overlap between the bounding boxes.
-
-    Arguments:
-    boxRef: The reference bounding box
-    boxes: A list of bounding boxes that should be compared to
-
-    Returns:
-    iou: A list of Intersection over Union measure for each compared bouding box
-    '''
-    x1 = np.maximum(boxRef[0], boxes[:, 0])
-    y1 = np.maximum(boxRef[1], boxes[:, 1])
-    x2 = np.minimum(boxRef[2], boxes[:, 2])
-    y2 = np.minimum(boxRef[3], boxes[:, 3])
-
-    boxRefArea = (boxRef[2] - boxRef[0]) * (boxRef[3] - boxRef[1])
-    boxesArea = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-
-    interArea = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
-    unionArea = boxRefArea + boxesArea - interArea
-    iou = np.array([0 if union == 0 else inter / union for inter, union in zip(interArea, unionArea)])
-
-    return iou
-
 def logData(bbox, kalman0):
     '''
     Log the data required for the tracking video.
@@ -103,7 +78,9 @@ def logData(bbox, kalman0):
     '''
     x0 = kalman0["x"]
     u = kalman0["u"]
-    P0 = kalman0["P"]
+    P0car = kalman0["Pcar"]
+    P0ped = kalman0["Pped"]
+    P0cyc = kalman0["Pcyc"]
     F = kalman0["F"]
     H = kalman0["H"]
     R = kalman0["R"]
@@ -114,7 +91,6 @@ def logData(bbox, kalman0):
         "bbox left": [], "bbox top": [], "bbox right": [], "bbox bottom": [],
         "score": []}
     kalmanLogPrev = {"track id": [], "x": [], "P": [], "Z": [], "time": []}
-    overlap = {"frame": [], "refID": [], "compareID": []}
 
     for i, frameBox in enumerate(bbox):
         img = cv2.imread(data[i])
@@ -122,7 +98,7 @@ def logData(bbox, kalman0):
 
         kalmanLog = {"track id": [], "x": [], "P": [], "Z": [], "time": []}
 
-        if frameBox is None:
+        if frameBox.id is None:
             kalmanLog = kalmanLogPrev.copy()
             for idx, Z in enumerate(kalmanLogPrev["Z"]):
                 x, P = kalman_filter(kalmanLogPrev["x"][idx], kalmanLogPrev["P"][idx], Z, F, H, R, u)
@@ -137,7 +113,7 @@ def logData(bbox, kalman0):
         frame = [i] * len(frameBox)
         trackID = [int(ID) for ID in frameBox.id]
         types = [class_names[int(box.cls)] for box in frameBox]
-        
+
         truncate = []
         for box in frameBox:
             coords = box.xyxy[0].cpu().numpy() if hasattr(box.xyxy[0], 'cpu') else box.xyxy[0]
@@ -155,13 +131,11 @@ def logData(bbox, kalman0):
         occlude = [0] * len(frameBox)
         alpha = []
         if i > 0:
-            for j, currID in enumerate(frameBox.id):
+            for j, currID in enumerate(trackID):
                 kalmanLog["track id"].append(int(currID))
-                # kalmanLog["Z"] = list(np.array([boxLeft, boxTop]).T) # states == 2
                 kalmanLog["Z"] = list(np.array([boxLeft, boxTop, boxRight, boxBottom]).T)
 
                 if currID in log["track id"][-1]:
-                    idx = np.where(np.array(log["track id"][-1]) == currID)[0][0]
                     yAxis = boxTop[j] - log["bbox top"][-1][idx]
                     xAxis = boxLeft[j] - log["bbox left"][-1][idx]
                     alphaVal = np.arctan2(yAxis, xAxis)
@@ -173,41 +147,31 @@ def logData(bbox, kalman0):
                     kalmanLog["time"].append(kalmanLogPrev["time"][boxIdx] + 1)
                 else:
                     alpha.append(0)
-                    kalmanLog["P"].append(P0)
+                    currentType = types[j]
+                    kalmanLog["P"].append(P0ped if currentType == "Pedestrian" else P0car if currentType == "Car" else P0cyc)
                     kalmanLog["x"].append(x0)
                     kalmanLog["time"].append(0)
 
-                
-
             for j, prevID in enumerate(log["track id"][-1]):
                 boxIdx = np.where(np.array(kalmanLogPrev["track id"]) == prevID)[0][0]
-                if prevID not in frameBox.id and log["truncated"][-1][j] == 0 and kalmanLogPrev["time"][boxIdx] > 10:
+                if prevID not in trackID and log["truncated"][-1][j] == 0 and kalmanLogPrev["time"][boxIdx] > 10:
+                    x1, y1, x2, y2 = kalmanLogPrev["x"][boxIdx][[0, 3, 6, 9]].reshape(-1,)
+                    outOfBounds = x1 <= 0 or x2 >= w or y1 <= 0 or y2 >= h
+                    yAxis = y1 - log["bbox top"][-1][j]
+                    xAxis = x1 - log["bbox left"][-1][j]
+                    alphaVal = np.arctan2(yAxis, xAxis)
+
                     frame.append(i)
                     trackID.append(log["track id"][-1][j])
                     types.append(log["type"][-1][j])
-
-                    # states == 2
-                    # predCenter = kalmanLogPrev["x"][boxIdx][[0, 3]].reshape(-1,)
-                    # currCenter = np.array([log["bbox left"][-1][j], log["bbox top"][-1][j]])
-                    # displace = predCenter - currCenter
-                    # x1, y1 = log["bbox left"][-1][j] + displace[0], log["bbox top"][-1][j] + displace[1]
-                    # x2, y2 = log["bbox right"][-1][j] + displace[0], log["bbox bottom"][-1][j] + displace[1]
-                    x1, y1, x2, y2 = kalmanLogPrev["x"][boxIdx][[0, 3, 6, 9]].reshape(-1,)
-                    outOfBounds = x1 <= 0 or x2 >= w or y1 <= 0 or y2 >= h
-
                     truncate.append(1 if outOfBounds else 0)
                     occlude.append(1)
-
+                    alpha.append(alphaVal)
                     boxLeft.append(x1)
                     boxTop.append(y1)
                     boxRight.append(x2)
                     boxBottom.append(y2)
                     score.append(0)
-
-                    yAxis = y1 - log["bbox top"][-1][j]
-                    xAxis = x1 - log["bbox left"][-1][j]
-                    alphaVal = np.arctan2(yAxis, xAxis)
-                    alpha.append(alphaVal)
                     
                     kalmanLog["track id"].append(prevID)
                     kalmanLog["x"].append(kalmanLogPrev["x"][boxIdx])
@@ -219,25 +183,9 @@ def logData(bbox, kalman0):
 
             kalmanLog["track id"] = list(frameBox.id)
             kalmanLog["x"] = [x0] * len(frameBox)
-            kalmanLog["P"] = [P0] * len(frameBox)
-            # kalmanLog["Z"] = list(np.array([boxLeft, boxTop]).T) # states == 2
+            kalmanLog["P"] = [P0ped if currentType == "Pedestrian" else P0car if currentType == "Car" else P0cyc for currentType in types]
             kalmanLog["Z"] = list(np.array([boxLeft, boxTop, boxRight, boxBottom]).T)
             kalmanLog["time"] = [0] * len(frameBox)
-
-        if 1 in occlude:
-            include = np.argwhere(np.array(occlude) == 1)[0][0]
-            compareBox = np.array([boxLeft[:include], boxTop[:include], boxRight[:include], boxBottom[:include]]).T
-            for idx, occl in enumerate(occlude):
-                if occl == 1:
-                    x1, y1, x2, y2 = boxLeft[idx], boxTop[idx], boxRight[idx], boxBottom[idx]
-                    box = np.array([x1, y1, x2, y2])
-
-                    iou = IoU(box, compareBox)
-                    maxIdx = np.argmax(iou)
-                    if iou[maxIdx] > 0.7:
-                        overlap["frame"].append(frame[0])
-                        overlap["refID"].append(trackID[idx])
-                        overlap["compareID"].append(trackID[maxIdx])
 
         log["frame"].append(frame)
         log["track id"].append(trackID)
@@ -272,34 +220,6 @@ def logData(bbox, kalman0):
 
     df = pd.DataFrame(log)
 
-    realOverlap = {"frame": [], "refID": [], "compareID": []}
-    remove = []
-
-    for i in range(len(overlap["frame"]) - 1):
-        if overlap["refID"][i] in realOverlap["refID"] and overlap["compareID"][i] in realOverlap["compareID"]:
-            continue
-        idx = np.where(np.array([overlap["refID"], overlap["compareID"]]).T == [overlap["refID"][i], overlap["compareID"][i]])[0]
-        repeat = [1 if rep == 0 else 0 for rep in np.diff(idx)]
-        if sum(repeat) > 1:
-            realOverlap["refID"].append(overlap["refID"][i])
-            realOverlap["compareID"].append(overlap["compareID"][i])
-            realOverlap["frame"].append(overlap["frame"][i])
-
-    for i in range(len(realOverlap["frame"]) - 1):
-        frameIdx = np.where(np.array((df["frame"] == realOverlap["frame"][i])))[0][0]
-        replace = df.iloc[frameIdx:-1]
-        rowIdx = np.where(np.array((replace["track id"] == realOverlap["compareID"][i])))[0][0]
-        replace = replace.iloc[rowIdx:-1]
-        refIdx = np.where(np.array((replace["track id"] == realOverlap["refID"][i])))[0]
-        remove.append(refIdx + frameIdx + rowIdx)
-
-    remove = [item for sublist in remove for item in sublist]
-    df.drop(remove)
-
-    for i in range(len(realOverlap["frame"]) - 1):
-        indexList = df.loc[df["track id"] == realOverlap["refID"][i]].index
-        df.iloc[indexList, 1] = realOverlap["compareID"][i]
-
     return df
 
 def save(height, width, fps = 10, name = "Pikachu"):
@@ -311,7 +231,7 @@ def save(height, width, fps = 10, name = "Pikachu"):
     df.to_csv(name + ".csv", index = False)
 
 if __name__ == "__main__":
-    seq = 1
+    seq = 3
     cam = "left"
 
     dataPath = currentPath + f"34759_final_project_rect/seq_0{seq}/image_0{2 if cam.lower() == 'left' else 3}/"
@@ -330,10 +250,12 @@ if __name__ == "__main__":
 
     x0 = np.zeros((3 * states, 1))
     u = np.zeros(x0.shape)
-    P0 = np.diag([10000, 10000, 10000] * states)
+    P0car = np.diag([100000, 100, 0.1] * states)
+    P0ped = np.diag([100000, 0.01, 0.000001] * states)
+    P0cyc = np.diag([100000, 0.01, 0.0001] * states)
     R = 0.0001 * np.eye(states)
 
-    F = np.eye(P0.shape[0])
+    F = np.eye(x0.shape[0])
     for i in range(F.shape[0]):
         try:
             F[i, i + 1] = deltaT if i % 3 != 2 and i < F.shape[0] - 1 else 0
@@ -341,11 +263,11 @@ if __name__ == "__main__":
         except:
             pass
 
-    H = np.zeros((R.shape[0], P0.shape[0]))
+    H = np.zeros((R.shape[0], x0.shape[0]))
     for i in range(H.shape[0]):
         H[i, i * 3] = 1
     
-    kalman0 = {"x": x0, "u": u, "P": P0, "F": F, "H": H, "R": R}
+    kalman0 = {"x": x0, "u": u, "Pcar": P0car, "Pped": P0ped, "Pcyc": P0cyc, "F": F, "H": H, "R": R}
 
     bbox = detect_objects(data)
     df = logData(bbox, kalman0)
@@ -353,7 +275,7 @@ if __name__ == "__main__":
     video = []
     for i in range(max(df["frame"])):
         img = cv2.imread(data[i])
-
+        
         if i not in df["frame"]:
             video.append(img)
             continue
@@ -373,4 +295,4 @@ if __name__ == "__main__":
     cv2.destroyAllWindows()
 
     h, w = video[0].shape[:2]
-    save(h, w, 1 / deltaT, "Result")
+    save(h, w, 1 / deltaT, f"Results/ResultSeq{seq}{cam}")
