@@ -64,11 +64,12 @@ def frame_bb(img, boxes, cls, track, trackChecker = None):
     
     return imgFrame
 
-def logData(bbox, kalman0):
+def logData(data, bbox, kalman0):
     '''
     Log the data required for the tracking video.
 
     Arguments:
+    data: A list of paths to the images
     bbox: A list of detected bounding box objects in all the images
     kalman0: A dictionary of the initial values for all the matrices in the kalman filter
     
@@ -222,7 +223,18 @@ def logData(bbox, kalman0):
 
     return df
 
-def save(height, width, fps = 10, name = "Pikachu"):
+def save(video, df, fps = 10, name = "Pikachu"):
+    '''
+    Save the tracking video and data frame to files.
+    
+    Arguments:
+    video: A list of frames in the video
+    df: A data frame for all the necessary data
+    fps: Frames per second for the video
+    name: Name of the output files
+    '''
+    height, width = video[0].shape[:2]
+
     out = cv2.VideoWriter(name + ".mp4", cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
     for frame in video:
         out.write(frame)
@@ -270,7 +282,7 @@ if __name__ == "__main__":
     kalman0 = {"x": x0, "u": u, "Pcar": P0car, "Pped": P0ped, "Pcyc": P0cyc, "F": F, "H": H, "R": R}
 
     bbox = detect_objects(data)
-    df = logData(bbox, kalman0)
+    df = logData(data, bbox, kalman0)
 
     video = []
     for i in range(max(df["frame"])):
@@ -294,5 +306,4 @@ if __name__ == "__main__":
         cv2.waitKey(int(deltaT * 1e+3))
     cv2.destroyAllWindows()
 
-    h, w = video[0].shape[:2]
-    save(h, w, 1 / deltaT, f"Results/ResultSeq{seq}{cam}")
+    save(video, df, 1 / deltaT, f"Results/ResultSeq{seq}{cam}")
