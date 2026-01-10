@@ -15,7 +15,7 @@ def detect_objects(data):
     Perform object detection on the input image using a pre-trained YOLO model.
     
     Arguments:
-    data: A list of paths to the images
+    data: A list of images
 
     Returns:
     bbox: A list of detected bounding box objects in all the images
@@ -24,8 +24,7 @@ def detect_objects(data):
     model = YOLO("kitti_yolo_runs/exp2/weights/best.pt")
 
     tracker = "bytetrack_modified.yaml"
-    for image_path in data:
-        img = cv2.imread(image_path)
+    for img in data:
         result = model.track(img, persist = True, tracker = tracker, iou = 0.7, conf = 0.5)
 
         try:
@@ -64,11 +63,12 @@ def frame_bb(img, boxes, cls, track, trackChecker = None):
     
     return imgFrame
 
-def logData(data, bbox, kalman0):
+def logData(imgList, bbox, kalman0):
     '''
     Log the data required for the tracking video.
 
     Arguments:
+    imgList: A list of images in the video
     data: A list of paths to the images
     bbox: A list of detected bounding box objects in all the images
     kalman0: A dictionary of the initial values for all the matrices in the kalman filter
@@ -94,7 +94,7 @@ def logData(data, bbox, kalman0):
     kalmanLogPrev = {"track id": [], "x": [], "P": [], "Z": [], "time": []}
 
     for i, frameBox in enumerate(bbox):
-        img = cv2.imread(data[i])
+        img = imgList[i]
         h, w = img.shape[:2]
 
         kalmanLog = {"track id": [], "x": [], "P": [], "Z": [], "time": []}
@@ -281,8 +281,9 @@ if __name__ == "__main__":
     
     kalman0 = {"x": x0, "u": u, "Pcar": P0car, "Pped": P0ped, "Pcyc": P0cyc, "F": F, "H": H, "R": R}
 
-    bbox = detect_objects(data)
-    df = logData(data, bbox, kalman0)
+    img = [cv2.imread(dataImg) for dataImg in data]
+    bbox = detect_objects(img)
+    df = logData(img, bbox, kalman0)
 
     video = []
     for i in range(max(df["frame"])):
